@@ -1,43 +1,20 @@
 import os
-import requests
-import pyarrow.parquet as pq
-import io
+import duckdb
 from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import HTTPException as FastAPIHTTPException
 from starlette.responses import JSONResponse
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ============ CONFIG ============
 API_KEY = os.environ.get("API_KEY", "psychoxd")
 DEVELOPER = "@psychopathmc"
 SUPPORT_MSG = "For API purchase, contact @psychopathmc"
 
-# 🎯 Internet Archive URLs (Phone)
-PHONE_URLS = {
-    0: "https://archive.org/download/psycho-phone-db/idx_phone.0.parquet",
-    1: "https://archive.org/download/psycho-phone-db/idx_phone.1.parquet",
-    2: "https://archive.org/download/psycho-phone-db/idx_phone.2.parquet",
-    3: "https://archive.org/download/psycho-phone-db/idx_phone.3.parquet",
-    4: "https://archive.org/download/psycho-phone-db/idx_phone.4.parquet",
-    5: "https://archive.org/download/psycho-phone-db/idx_phone.5.parquet",
-    6: "https://archive.org/download/psycho-phone-db/idx_phone.6.parquet",
-}
+PHONE_BASE = "https://archive.org/download/psycho-phone-db"
+AADHAR_BASE = "https://archive.org/download/psycho-aadhar-db"
 
-# 🎯 Internet Archive URLs (Aadhaar)
-AADHAR_URLS = {
-    0: "https://archive.org/download/psycho-aadhar-db/idx_aadhar.0.parquet",
-    1: "https://archive.org/download/psycho-aadhar-db/idx_aadhar.1.parquet",
-    2: "https://archive.org/download/psycho-aadhar-db/idx_aadhar.2.parquet",
-    3: "https://archive.org/download/psycho-aadhar-db/idx_aadhar.3.parquet",
-    4: "https://archive.org/download/psycho-aadhar-db/idx_aadhar.4.parquet",
-    5: "https://archive.org/download/psycho-aadhar-db/idx_aadhar.5.parquet",
-    6: "https://archive.org/download/psycho-aadhar-db/idx_aadhar.6.parquet",
-}
-
-CACHE_TTL = 300
-
-app = FastAPI(title="PsychopathMC OSINT API", version="16.0")
+app = FastAPI(title="PsychopathMC OSINT API", version="17.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.exception_handler(FastAPIHTTPException)
@@ -46,45 +23,44 @@ async def custom_http_exception_handler(request: Request, exc: FastAPIHTTPExcept
         "error": exc.detail, "developer": DEVELOPER, "support": SUPPORT_MSG
     })
 
-_cache, _cache_time = {}, {}
+# ============ DuckDB Connection ============
+_conn = None
 
-def get_cache(key):
-    if key in _cache and (datetime.now() - _cache_time[key]).seconds < CACHE_TTL:
-        return _cache[key]
-    return None
+def get_conn():
+    global _conn
+    if _conn is None:
+        _conn = duckdb.connect()
+        _conn.execute("SET home_directory='/tmp'")
+        _conn.execute("SET extension_directory='/tmp/duckdb_extensions'")
+        _conn.execute("INSTALL httpfs; LOAD httpfs;")
+        _conn.execute("SET threads=2;")
+    return _conn
 
-def set_cache(key, data):
-    _cache[key] = data
-    _cache_time[key] = datetime.now()
-    if len(_cache) > 100:
-        oldest = min(_cache_time, key=_cache_time.get)
-        del _cache[oldest]
-        del _cache_time[oldest]
 
-def fetch_data(url: str, column: str, value: str, limit: int = 15):
-    if not url:
+def fetch_data(base_url: str, shard: int, column: str, value: str, limit: int = 15):
+    """DuckDB se directly remote Parquet query karo — streaming, no full download"""
+    try:
+        file_url = f"{base_url}/idx_{'phone' if 'phone' in base_url else 'aadhar'}.{shard}.parquet"
+        # Better: derive filename properly
+        if "phone" in base_url:
+            file_url = f"{base_url}/idx_phone.{shard}.parquet"
+        else:
+            file_url = f"{base_url}/idx_aadhar.{shard}.parquet"
+
+        con = get_conn()
+        sql = f"""
+            SELECT name, fathersName, phoneNumber, aadharNumber, otherNumber, address
+            FROM read_parquet('{file_url}')
+            WHERE {column} = '{value}'
+            LIMIT {limit}
+        """
+        rows = con.execute(sql).fetchall()
+        cols = [d[0] for d in con.description]
+        return [dict(zip(cols, r)) for r in rows]
+    except Exception as e:
+        print(f"[ERROR] {type(e).__name__}: {e}")
         return []
-    cached_df = get_cache(url)
-    if cached_df is not None:
-        df = cached_df
-    else:
-        try:
-            print(f"[FETCH] {url}")
-            resp = requests.get(url, timeout=180, stream=True)
-            if resp.status_code != 200:
-                return []
-            needed_cols = ["name", "fathersName", "phoneNumber",
-                          "aadharNumber", "otherNumber", "address"]
-            table = pq.read_table(io.BytesIO(resp.content), columns=needed_cols)
-            df = table.to_pandas()
-            set_cache(url, df)
-        except Exception as e:
-            print(f"[ERROR] {type(e).__name__}: {e}")
-            return []
-    if column not in df.columns:
-        return []
-    filtered = df[df[column] == value]
-    return filtered.head(limit).to_dict(orient="records")
+
 
 @app.get("/")
 def root():
@@ -113,6 +89,31 @@ def search(
     query = (q or mobile or "").strip()
     if not query:
         raise HTTPException(422, "Provide q or mobile")
+
+    shard = int(query[-1]) % 7
+
+    # Phone first
+    results = fetch_data(PHONE_BASE, shard, "phoneNumber", query, limit)
+
+    # Aadhaar fallback
+    if not results:
+        results = fetch_data(AADHAR_BASE, shard, "aadharNumber", query, limit)
+
+    # Deduplicate
+    seen, unique = set(), []
+    for row in results:
+        a = row.get("aadharNumber")
+        if a not in seen:
+            seen.add(a); unique.append(row)
+
+    return {
+        "success": len(unique) > 0,
+        "query": query,
+        "count": len(unique),
+        "results": unique,
+        "developer": DEVELOPER,
+        "support": SUPPORT_MSG,
+    }        raise HTTPException(422, "Provide q or mobile")
     shard = int(query[-1]) % 7
     phone_url = PHONE_URLS.get(shard)
     results = fetch_data(phone_url, "phoneNumber", query, limit) if phone_url else []
